@@ -85,3 +85,17 @@ skills/openclaw/video-production/vendor/**/node_modules/
 skills/openclaw/video-production/vendor/**/.remotion/
 skills/openclaw/video-production/vendor/**/models/
 skills/openclaw/video-production/vendor/**/*large-v3*
+
+# ── Hermes 接入层（见 README-HERMES.md）─────────────────────────
+# 生成物：`bash hermes-setup.sh sync` 会从上游重建，不入库
+# （AGENTS.md 内含本机绝对路径，SOUL.md 是上游副本）
+AGENTS.md
+SOUL.md
+
+# 运行期状态
+.hermes/skills/
+.hermes-shim/sessions.json
+.hermes-shim/usage/
+.hermes-shim/usage.json
+.hermes-shim/web.pid
+.hermes-shim/*.log

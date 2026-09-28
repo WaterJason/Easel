@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""openclaw → hermes 转发层（shim）
+
+Easel 的程序层（web/app.py、easel/commands/*.py、scripts/gateway.sh）把 Agent
+运行时的命令名写死成 `openclaw ...`。本脚本伪装成 `openclaw`，把调用翻译成
+Hermes Agent 的命令行，从而在不修改 Easel 源码的前提下换掉引擎。
+
+支持的调用形态（来自 Easel 源码实测）：
+
+    openclaw --profile <p> agent --agent main \
+        --session-key <k> --session-id <uuid5> \
+        --thinking <lvl> --timeout <sec> --message <msg>
+
+    openclaw --profile <p> chat --session <k> --timeout-ms <ms> --message <msg>
+
+    openclaw --profile <p> gateway {start|stop|restart|status|logs}
+    openclaw --version
+
+环境变量：
+    EASEL_ROOT              项目根（缺省从本脚本位置推断）
+    OPENCLAW_RAW_STREAM     置 1 时，把回答写成 OpenClaw 格式的 JSONL 事件流
+    OPENCLAW_RAW_STREAM_PATH  该 JSONL 的落盘路径
+    EASEL_SHIM_NO_YOLO      置 1 则不传 --yolo（默认传，避免无人值守时卡在审批）
+    EASEL_SHIM_LOG          置 1 时把转发详情写到 .hermes-shim/shim.log
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SHIM_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(os.environ.get("EASEL_ROOT", "").strip() or SHIM_DIR.parent)
+SESSION_MAP = SHIM_DIR / "sessions.json"
+LOG_FILE = SHIM_DIR / "shim.log"
+USAGE_DIR = SHIM_DIR / "usage"
+
+HERMES = shutil.which("hermes") or str(Path.home() / ".local" / "bin" / "hermes")
+
+
+def log(msg: str) -> None:
+    if os.environ.get("EASEL_SHIM_LOG") != "1":
+        return
+    try:
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
+    except OSError:
+        pass
+
+
+def load_map() -> dict:
+    try:
+        data = json.loads(SESSION_MAP.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_map(mapping: dict) -> None:
+    try:
+        SHIM_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SESSION_MAP.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(mapping, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(SESSION_MAP)
+    except OSError:
+        pass
+
+
+def parse_argv(argv: list[str]) -> tuple[str | None, str | None, dict, list[str]]:
+    """拆出 (子命令, --session-id, 具名参数, 位置参数)。全局 --profile 被忽略。"""
+    sub = None
+    opts: dict[str, str] = {}
+    positional: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--profile" and i + 1 < len(argv):
+            i += 2
+            continue
+        if tok.startswith("--"):
+            key = tok[2:]
+            if "=" in key:
+                key, val = key.split("=", 1)
+                opts[key] = val
+                i += 1
+                continue
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                opts[key] = argv[i + 1]
+                i += 2
+                continue
+            opts[key] = "1"
+            i += 1
+            continue
+        if sub is None:
+            sub = tok
+        else:
+            positional.append(tok)
+        i += 1
+    return sub, opts.get("session-id"), opts, positional
+
+
+def write_raw_events(expected_sid: str, text: str) -> None:
+    """把整段回答写成 OpenClaw raw-stream 事件。
+
+    注意：Hermes 没有 stream-json 输出模式，所以这里是一次性事件（非逐字增量）。
+    前端仍能正常显示，只是答案整体出现而非逐字浮现。
+    """
+    if os.environ.get("OPENCLAW_RAW_STREAM") != "1":
+        return
+    path = os.environ.get("OPENCLAW_RAW_STREAM_PATH", "").strip()
+    if not path or not text:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "sessionId": expected_sid,
+                "event": "assistant_text_stream",
+                "evtType": "text_delta",
+                "delta": text,
+            }, ensure_ascii=False) + "\n")
+            f.write(json.dumps({
+                "sessionId": expected_sid,
+                "event": "assistant_message_end",
+            }, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log(f"raw stream write failed: {e}")
+
+
+def project_prefix() -> str:
+    """每轮消息前缀：把项目根显式告诉 Agent。
+
+    为什么必须这么做：Hermes 的 `--in DIR` 只改会话分组标签，**不改工具的工作目录**
+    （实测：即使进程 CWD 已是项目根、且传了 `--in`，Agent 的 pwd 仍是 $HOME，
+    列出的也是家目录内容）。而 `terminal.cwd` 是全局配置，改成项目根会连带影响
+    使用者其他 Hermes 用法，不能动。
+
+    后果若不修：Agent 把产物写到 ~/outputs/，且问它"项目里有几个内容项目"会答 0
+    （因为它在 $HOME 下 ls outputs/ 失败）。
+
+    这段前缀与 Easel AGENTS.md 第 2 条「先到项目根」是同一条约束，只是改成每轮显式重申。
+    """
+    return (
+        f"〔系统·非用户所说〕本项目根目录是 {PROJECT_ROOT}。"
+        "本项目所有相对路径（outputs/、skills/、profiles/、assets/、.env）都以该目录为基准。"
+        "运行任何项目脚本、读写任何产物之前，先 cd 到该目录；"
+        "不要在别的目录下新建 outputs/。"
+    )
+
+
+def run_agent(message: str, easel_sid: str | None, timeout: int | None) -> int:
+    if not message:
+        print("shim: 缺少 --message", file=sys.stderr)
+        return 2
+
+    message = f"{project_prefix()}\n\n{message}"
+
+    mapping = load_map()
+    key = easel_sid or "default"
+    hermes_sid = mapping.get(key)
+
+    USAGE_DIR.mkdir(parents=True, exist_ok=True)
+    usage_path = USAGE_DIR / f"{int(time.time() * 1000)}.json"
+
+    cmd = [HERMES, "--in", str(PROJECT_ROOT), "--cli"]
+    if hermes_sid:
+        cmd += ["--resume", hermes_sid]
+    if os.environ.get("EASEL_SHIM_NO_YOLO") != "1":
+        cmd += ["--yolo"]
+    cmd += ["-z", message, "--usage-file", str(usage_path)]
+
+    log(f"run key={key} resume={hermes_sid or '-'} msg_len={len(message)}")
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1, cwd=str(PROJECT_ROOT))
+
+    def _forward(signum, _frame):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        sys.exit(130)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _forward)
+        except (ValueError, OSError):
+            pass
+
+    lines: list[str] = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        lines.append(line)
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    rc = proc.wait()
+
+    text = "".join(lines).strip()
+    write_raw_events(easel_sid or "", text)
+
+    try:
+        usage = json.loads(usage_path.read_text(encoding="utf-8"))
+        new_sid = usage.get("session_id")
+        if new_sid:
+            mapping[key] = new_sid
+            save_map(mapping)
+            log(f"session {key} -> {new_sid}  tokens_in={usage.get('input_tokens')} "
+                f"tokens_out={usage.get('output_tokens')} model={usage.get('model')}")
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            usage_path.unlink()
+        except OSError:
+            pass
+
+    return rc
+
+
+def run_gateway(action: str) -> int:
+    """Easel 只用 gateway 子命令启停本地 gateway。Hermes 路线下没有等价物，
+    如实说明并返回成功，避免脚本因非零退出码中断。"""
+    if action in ("status", "logs"):
+        print(f"shim: gateway {action} — 本机运行在 Hermes 上，无独立 gateway 进程")
+        return 0
+    print(f"shim: gateway {action} — 已忽略（Hermes 无需 gateway）")
+    return 0
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("--version", "-v", "version"):
+        print("openclaw shim → Hermes Agent")
+        return 0
+
+    sub, easel_sid, opts, positional = parse_argv(argv)
+
+    if sub == "agent":
+        timeout = int(opts.get("timeout") or 0) or None
+        return run_agent(opts.get("message", ""), easel_sid, timeout)
+    if sub == "chat":
+        return run_agent(opts.get("message", ""), opts.get("session"), None)
+    if sub == "gateway":
+        return run_gateway(positional[0] if positional else "status")
+
+    print(f"shim: 未处理的子命令 {sub!r}；参数 {argv}", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
