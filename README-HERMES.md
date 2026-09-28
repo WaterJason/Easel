@@ -116,5 +116,30 @@ Hermes 立刻看到，不需要同步。上游删掉某个技能时链接变断�
 ## 前置条件
 
 - macOS（转发层用了 `fcntl` 风格的锁语义与 macOS 路径习惯；Linux 大致可用但未测）
-- Hermes Agent v0.20+（转发层依赖 `--usage-file`、`prompt-size`、`skills trust`）
+- Hermes Agent v0.20+（转发层依赖 `--usage-file`、`prompt-size`、`skills trust`、
+  `--accept-hooks`）
 - Python 3.11+、Node 18+（Easel 自身要求）
+- **Hermes 的模型 provider 必须可达**——见下
+
+## ⚠️ 如果 Hermes 指向本地 provider 桥，那个桥必须先起来
+
+Hermes 可以把模型指向一个本地进程（`~/.hermes/config.yaml` 里 `providers.<名>.base_url`
+形如 `http://127.0.0.1:PORT/v1`，用途是把订阅账号暴露成 OpenAI 兼容端点）。
+
+**那个桥没启动时，Hermes 只报笼统的 `API call failed after 3 retries: Connection error.`**
+——完全看不出是本地依赖没起，极易误判成网络问题、代理问题或授权过期。
+
+自检里有一项专门查这个：
+
+```
+Provider 端点
+  ✓ 本地 provider「magpie」在跑（http://127.0.0.1:3425/v1）
+```
+
+报 ✗ 就是桥没起。手动确认：
+
+```bash
+lsof -iTCP:<端口> -sTCP:LISTEN
+hermes status        # 看 Model / Provider 那两行
+```
+

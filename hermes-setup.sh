@@ -195,7 +195,33 @@ do_check() {
       bad "模型调用无输出（超时或挂起）—— 检查是否 hook 等待审批、或代理环境变量被继承"
     else
       bad "模型调用失败：$(printf '%s' "$out" | head -1 | cut -c1-120)"
-      printf '      常见原因：代理环境变量被继承。用 env -u HTTP_PROXY -u HTTPS_PROXY 起服务\n'
+      printf '      先看下面的「Provider 端点」一项；若不是本地端点问题，再查代理环境变量\n'
+    fi
+  fi
+
+  # Provider 端点可达性：Hermes 可以把模型指向本地桥（base_url 形如
+  # http://127.0.0.1:PORT/v1）。那个桥没启动时，Hermes 只报笼统的
+  # "Connection error"，很难定位。这里直接查端口，把原因指出来。
+  hdr "Provider 端点"
+  local purl pport pname
+  purl=$(sed -n 's/^ *base_url: *\(http[^ ]*\).*/\1/p' "$HOME/.hermes/config.yaml" 2>/dev/null \
+         | grep -E "127\.0\.0\.1|localhost" | head -1)
+  pname=$(sed -n '/^providers:/,/^[a-z]/p' "$HOME/.hermes/config.yaml" 2>/dev/null \
+          | grep -oE "^  [a-z0-9_-]+:" | head -1 | tr -d ' :')
+  if [ -z "$purl" ]; then
+    printf '  使用远程端点，无需本地检查\n'
+  else
+    pport=$(printf '%s' "$purl" | grep -oE ':[0-9]+' | tr -d ':')
+    # 注意：变量后面紧跟中文全角标点时必须用 ${var} 界定，
+    # 否则 bash 会把多字节字符的第一个字节当成变量名的一部分（报 "unbound variable"）。
+    if curl -s --noproxy '*' -o /dev/null --max-time 3 "http://127.0.0.1:${pport}/" 2>/dev/null \
+       || curl -s --noproxy '*' -o /dev/null -w '%{http_code}' --max-time 3 \
+          "http://127.0.0.1:${pport}/v1/models" 2>/dev/null | grep -qE '^[0-9]'; then
+      ok "本地 provider「${pname:-?}」在跑（${purl}）"
+    else
+      bad "本地 provider「${pname:-?}」没在跑：${purl} 无响应"
+      printf '      这会让 Hermes 只报 "Connection error"，实际是桥没启动。\n'
+      printf '      检查：lsof -iTCP:%s -sTCP:LISTEN\n' "${pport}"
     fi
   fi
 
