@@ -65,8 +65,31 @@ Hermes 加载项目规则前会做提示注入扫描（`tools/threat_patterns.py
 
 所以转发层**每轮消息前缀里显式带上项目根**——这是必须的，否则 Agent 找不到项目。
 
-自检会量 `hermes prompt-size` 的注入字节数来判断第 1 条（应 ≥ `AGENTS.md` 文件大小），
-并真跑一次模型调用来暴露网络/代理问题。
+## ⚠️ 如果你的 Hermes 配了 shell hook，必须传 `--accept-hooks`
+
+`~/.hermes/config.yaml` 里若声明了 `hooks:`（例如 `on_session_start` / `pre_tool_call`），
+Hermes 首次遇到会弹：
+
+```
+Allow this hook to run? [y/N]:
+```
+
+**无人值守的运行会永久卡在这里**——没有输出、没有超时、没有报错（实测一句两个字的话
+挂了 45 分钟不返回）。转发层因此默认加 `--accept-hooks`。
+
+注意 **`--yolo` 管不了这个**：`--yolo` 绕过的是危险命令审批，hook 审批是另一套。
+两个都要传。
+
+可用 `EASEL_SHIM_NO_ACCEPT_HOOKS=1` 关掉（那时若配了 hook 就会卡，需自行处理）。
+或者在 Hermes 侧一次性关掉提示：`hooks_auto_accept: true`。
+
+## 自检覆盖了什么
+
+`bash hermes-setup.sh` 会查：转发层可执行 / hermes 可达 / 技能数与链接数一致 / 断链数 /
+**规则注入字节数（判断第 1 条静默失效）** / 两个端口 / **真跑一次模型调用**
+（带 120 秒超时，用 `perl alarm` 兜底——macOS 没有 GNU `timeout`）/ 仓库整洁。
+
+模型那一步最容易漏，但代理继承、hook 死锁这类问题只有真跑才暴露。
 
 ## 上游更新后
 

@@ -92,6 +92,10 @@ skills/openclaw/video-production/vendor/**/*large-v3*
 AGENTS.md
 SOUL.md
 
+# Python 虚拟环境（start-easel.sh 会自动探测）
+.venv/
+venv/
+
 # 运行期状态
 .hermes/skills/
 .hermes-shim/sessions.json

@@ -172,6 +172,14 @@ def run_agent(message: str, easel_sid: str | None, timeout: int | None) -> int:
         cmd += ["--resume", hermes_sid]
     if os.environ.get("EASEL_SHIM_NO_YOLO") != "1":
         cmd += ["--yolo"]
+    # --accept-hooks 与 --yolo 是两回事，缺了会死锁：
+    #   用户 config.yaml 里若声明了 shell hook，Hermes 首次遇到会弹
+    #   "Allow this hook to run? [y/N]" 等 TTY 输入。无人值守时永远等不到回答，
+    #   进程挂死且没有任何输出（实测：一句两个字的话跑 45 分钟不返回）。
+    #   --yolo 只管危险命令审批，管不到 hook。
+    #   可用 EASEL_SHIM_NO_ACCEPT_HOOKS=1 关掉（那时若配了 hook 就会卡，需自行处理）。
+    if os.environ.get("EASEL_SHIM_NO_ACCEPT_HOOKS") != "1":
+        cmd += ["--accept-hooks"]
     cmd += ["-z", message, "--usage-file", str(usage_path)]
 
     log(f"run key={key} resume={hermes_sid or '-'} msg_len={len(message)}")

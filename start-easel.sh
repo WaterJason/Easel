@@ -17,22 +17,33 @@ PORT="${1:-7860}"
 # ~/.local/bin 不在里面 → 找不到 hermes。显式补上。
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
-# 找 Python 环境：优先 $EASEL_VENV，其次仓库内 .venv，最后回退到系统 python3
-if [ -n "${EASEL_VENV:-}" ] && [ -x "$EASEL_VENV/bin/python" ]; then
-  PY="$EASEL_VENV/bin/python"
-elif [ -x "$ROOT/.venv/bin/python" ]; then
-  PY="$ROOT/.venv/bin/python"
-elif [ -x "$ROOT/venv/bin/python" ]; then
-  PY="$ROOT/venv/bin/python"
-else
+# 找 Python 环境：优先 $EASEL_VENV（指向 venv 目录），其次仓库内 .venv / venv，
+# 最后回退系统 python3
+PY=""
+for cand in "${EASEL_VENV:+$EASEL_VENV/bin/python}" "$ROOT/.venv/bin/python" "$ROOT/venv/bin/python"; do
+  [ -n "$cand" ] && [ -x "$cand" ] && { PY="$cand"; break; }
+done
+
+# 候选都不存在时，回退到系统 python3 —— 但它大概率没装依赖，
+# 所以下面必须校验，否则会在启动几秒后抛 ModuleNotFoundError，很难定位。
+if [ -z "$PY" ]; then
   PY="$(command -v python3 || true)"
 fi
 
 if [ -z "$PY" ] || [ ! -x "$PY" ]; then
-  echo "找不到可用的 Python 环境。" >&2
-  echo "请先建一个并装依赖：" >&2
+  echo "找不到可用的 Python 解释器。" >&2
+  echo "请建一个环境并装依赖：" >&2
   echo "  python3 -m venv \"$ROOT/.venv\"" >&2
   echo "  \"$ROOT/.venv/bin/pip\" install -e \"$ROOT\"" >&2
+  echo "或用 EASEL_VENV=/path/to/venv 指定已有环境。" >&2
+  exit 1
+fi
+
+# 依赖校验：确认选中的解释器真的装了 Easel 的依赖。
+# （不校验的话，回退到系统 python3 会在启动后几秒才报 ModuleNotFoundError）
+if ! "$PY" -c 'import fastapi, uvicorn' >/dev/null 2>&1; then
+  echo "选中的 Python 环境缺少依赖：$PY" >&2
+  echo "装一下：\"$PY\" -m pip install -e \"$ROOT\"" >&2
   echo "或用 EASEL_VENV=/path/to/venv 指定已有环境。" >&2
   exit 1
 fi

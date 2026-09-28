@@ -25,6 +25,15 @@ bad()  { printf '  \033[31m✗\033[0m %s\n' "$1"; fail=$((fail+1)); }
 note() { printf '  \033[33m!\033[0m %s\n' "$1"; warn=$((warn+1)); }
 hdr()  { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
+# macOS 自带没有 GNU timeout；gtimeout 要 coreutils；再不行用 perl alarm 兜底。
+_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$secs" "$@"
+  elif command -v perl >/dev/null 2>&1; then perl -e 'alarm shift; exec @ARGV' "$secs" "$@"
+  else "$@"; fi
+}
+
 # ─────────────────────────────────────────────────────────── 重建
 do_sync() {
   hdr "重建技能链接"
@@ -171,10 +180,19 @@ do_check() {
   if [ "$deep" = "yes" ]; then
     hdr "模型连通（会真实调用一次，约 20 秒）"
     local out
-    out=$(cd "$ROOT" && env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
-          hermes --in "$ROOT" --cli -z "只回复两个字：正常" 2>&1 | tail -3)
+    # --accept-hooks 必须传：config.yaml 里声明了 shell hook 时，Hermes 会弹
+    # "Allow this hook to run? [y/N]" 等 TTY 输入，无人值守会永久挂死。
+    # 用 timeout 兜底，避免把自检本身也卡住。
+    out=$(
+      cd "$ROOT" || exit 1
+      unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+      _with_timeout 120 hermes --in "$ROOT" --cli --accept-hooks \
+        -z "只回复两个字：正常" 2>&1 | tail -3
+    )
     if printf '%s' "$out" | grep -q "正常"; then
       ok "模型可达"
+    elif [ -z "$out" ]; then
+      bad "模型调用无输出（超时或挂起）—— 检查是否 hook 等待审批、或代理环境变量被继承"
     else
       bad "模型调用失败：$(printf '%s' "$out" | head -1 | cut -c1-120)"
       printf '      常见原因：代理环境变量被继承。用 env -u HTTP_PROXY -u HTTPS_PROXY 起服务\n'
